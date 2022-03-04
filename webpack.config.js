@@ -72,13 +72,11 @@ module.exports = [
         },
         externals: {
             'decode-html': true,
-            'escape-html': true,
             'format-message': true,
             'htmlparser2': true,
             'immutable': true,
             'jszip': true,
             'minilog': true,
-            'nets': true,
             'scratch-parser': true,
             'socket.io-client': true,
             'text-encoding': true

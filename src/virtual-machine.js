@@ -109,20 +109,26 @@ class VirtualMachine extends EventEmitter {
         this.runtime.on(Runtime.BLOCK_DRAG_END, (blocks, topBlockId) => {
             this.emit(Runtime.BLOCK_DRAG_END, blocks, topBlockId);
         });
-        this.runtime.on(Runtime.EXTENSION_ADDED, blocksInfo => {
-            this.emit(Runtime.EXTENSION_ADDED, blocksInfo);
+        this.runtime.on(Runtime.EXTENSION_ADDED, categoryInfo => {
+            this.emit(Runtime.EXTENSION_ADDED, categoryInfo);
         });
         this.runtime.on(Runtime.EXTENSION_FIELD_ADDED, (fieldName, fieldImplementation) => {
             this.emit(Runtime.EXTENSION_FIELD_ADDED, fieldName, fieldImplementation);
         });
-        this.runtime.on(Runtime.BLOCKSINFO_UPDATE, blocksInfo => {
-            this.emit(Runtime.BLOCKSINFO_UPDATE, blocksInfo);
+        this.runtime.on(Runtime.BLOCKSINFO_UPDATE, categoryInfo => {
+            this.emit(Runtime.BLOCKSINFO_UPDATE, categoryInfo);
         });
         this.runtime.on(Runtime.BLOCKS_NEED_UPDATE, () => {
             this.emitWorkspaceUpdate();
         });
+        this.runtime.on(Runtime.TOOLBOX_EXTENSIONS_NEED_UPDATE, () => {
+            this.extensionManager.refreshBlocks();
+        });
         this.runtime.on(Runtime.PERIPHERAL_LIST_UPDATE, info => {
             this.emit(Runtime.PERIPHERAL_LIST_UPDATE, info);
+        });
+        this.runtime.on(Runtime.USER_PICKED_PERIPHERAL, info => {
+            this.emit(Runtime.USER_PICKED_PERIPHERAL, info);
         });
         this.runtime.on(Runtime.PERIPHERAL_CONNECTED, () =>
             this.emit(Runtime.PERIPHERAL_CONNECTED)
@@ -150,6 +156,11 @@ class VirtualMachine extends EventEmitter {
         });
 
         this.extensionManager = new ExtensionManager(this.runtime);
+
+        // Load core extensions
+        for (const id of CORE_EXTENSIONS) {
+            this.extensionManager.loadExtensionIdSync(id);
+        }
 
         this.blockListener = this.blockListener.bind(this);
         this.flyoutBlockListener = this.flyoutBlockListener.bind(this);
@@ -377,6 +388,7 @@ class VirtualMachine extends EventEmitter {
 
         return zip.generateAsync({
             type: 'blob',
+            mimeType: 'application/x.scratch.sb3',
             compression: 'DEFLATE',
             compressionOptions: {
                 level: 6 // Tradeoff between best speed (1) and best compression (9)
@@ -427,6 +439,7 @@ class VirtualMachine extends EventEmitter {
 
         return zip.generateAsync({
             type: typeof optZipType === 'string' ? optZipType : 'blob',
+            mimeType: 'application/x.scratch.sprite3',
             compression: 'DEFLATE',
             compressionOptions: {
                 level: 6
@@ -465,6 +478,9 @@ class VirtualMachine extends EventEmitter {
         // Clear the current runtime
         this.clear();
 
+        if (typeof performance !== 'undefined') {
+            performance.mark('scratch-vm-deserialize-start');
+        }
         const runtime = this.runtime;
         const deserializePromise = function () {
             const projectVersion = projectJSON.projectVersion;
@@ -479,8 +495,14 @@ class VirtualMachine extends EventEmitter {
             return Promise.reject('Unable to verify Scratch Project version.');
         };
         return deserializePromise()
-            .then(({targets, extensions}) =>
-                this.installTargets(targets, extensions, true));
+            .then(({targets, extensions}) => {
+                if (typeof performance !== 'undefined') {
+                    performance.mark('scratch-vm-deserialize-end');
+                    performance.measure('scratch-vm-deserialize',
+                        'scratch-vm-deserialize-start', 'scratch-vm-deserialize-end');
+                }
+                return this.installTargets(targets, extensions, true);
+            });
     }
 
     /**
@@ -492,14 +514,6 @@ class VirtualMachine extends EventEmitter {
      */
     installTargets (targets, extensions, wholeProject) {
         const extensionPromises = [];
-
-        if (wholeProject) {
-            CORE_EXTENSIONS.forEach(extensionID => {
-                if (!this.extensionManager.isExtensionLoaded(extensionID)) {
-                    extensionPromises.push(this.extensionManager.loadExtensionURL(extensionID));
-                }
-            });
-        }
 
         extensions.extensionIDs.forEach(extensionID => {
             if (!this.extensionManager.isExtensionLoaded(extensionID)) {
@@ -798,6 +812,8 @@ class VirtualMachine extends EventEmitter {
             sound.assetId = sound.asset.assetId;
             sound.dataFormat = storage.DataFormat.WAV;
             sound.md5 = `${sound.assetId}.${sound.dataFormat}`;
+            sound.sampleCount = newBuffer.length;
+            sound.rate = newBuffer.sampleRate;
         }
         // If soundEncoding is null, it's because gui had a problem
         // encoding the updated sound. We don't want to store anything in this
@@ -862,10 +878,13 @@ class VirtualMachine extends EventEmitter {
         costume.rotationCenterX = rotationCenterX;
         costume.rotationCenterY = rotationCenterY;
 
+        // If the bitmap originally had a zero width or height, use that value
+        const bitmapWidth = bitmap.sourceWidth === 0 ? 0 : bitmap.width;
+        const bitmapHeight = bitmap.sourceHeight === 0 ? 0 : bitmap.height;
         // @todo: updateBitmapSkin does not take ImageData
         const canvas = document.createElement('canvas');
-        canvas.width = bitmap.width;
-        canvas.height = bitmap.height;
+        canvas.width = bitmapWidth;
+        canvas.height = bitmapHeight;
         const context = canvas.getContext('2d');
         context.putImageData(bitmap, 0, 0);
 
@@ -885,7 +904,7 @@ class VirtualMachine extends EventEmitter {
                 const storage = this.runtime.storage;
                 costume.dataFormat = storage.DataFormat.PNG;
                 costume.bitmapResolution = bitmapResolution;
-                costume.size = [bitmap.width, bitmap.height];
+                costume.size = [bitmapWidth, bitmapHeight];
                 costume.asset = storage.createAsset(
                     storage.AssetType.ImageBitmap,
                     costume.dataFormat,
@@ -897,7 +916,10 @@ class VirtualMachine extends EventEmitter {
                 costume.md5 = `${costume.assetId}.${costume.dataFormat}`;
                 this.emitTargetsUpdate();
             });
-            reader.readAsArrayBuffer(blob);
+            // Bitmaps with a zero width or height return null for their blob
+            if (blob){
+                reader.readAsArrayBuffer(blob);
+            }
         });
     }
 
@@ -1077,12 +1099,8 @@ class VirtualMachine extends EventEmitter {
         return this.runtime && this.runtime.renderer;
     }
 
-    /**
-     * Set the svg adapter for the VM/runtime, which converts scratch 2 svgs to scratch 3 svgs
-     * @param {!SvgRenderer} svgAdapter The adapter to attach
-     */
-    attachV2SVGAdapter (svgAdapter) {
-        this.runtime.attachV2SVGAdapter(svgAdapter);
+    // @deprecated
+    attachV2SVGAdapter () {
     }
 
     /**
@@ -1521,6 +1539,14 @@ class VirtualMachine extends EventEmitter {
             }
         }
         return null;
+    }
+
+    /**
+     * Allow VM consumer to configure the ScratchLink socket creator.
+     * @param {Function} factory The custom ScratchLink socket factory.
+     */
+    configureScratchLinkSocketFactory (factory) {
+        this.runtime.configureScratchLinkSocketFactory(factory);
     }
 }
 
